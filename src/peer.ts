@@ -19,7 +19,8 @@ import http from 'http';
 import { Bonjour } from 'bonjour-service';
 import type { Service as BonjourService } from 'bonjour-service';
 import OpenAI from 'openai';
-import { loadIdentity } from './identity.js';
+import { loadIdentity, loadPeerToken } from './identity.js';
+import { apiLimiter, chatLimiter } from './ratelimit.js';
 import {
   getAllFacts,
   saveFact,
@@ -100,10 +101,11 @@ export async function fetchPeerStatus(peer: PeerInfo): Promise<Record<string, un
  * The peer returns SSE; we print tokens as they arrive.
  */
 export async function askPeer(peer: PeerInfo, query: string): Promise<void> {
+  const token = loadPeerToken();
   const url = `http://${peer.address}:${peer.port}/query`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
     body: JSON.stringify({ query }),
     signal: AbortSignal.timeout(120_000),
   });
@@ -141,8 +143,12 @@ export async function askPeer(peer: PeerInfo, query: string): Promise<void> {
  * Existing local keys are NOT overwritten.
  */
 export async function pullFactsFromPeer(peer: PeerInfo): Promise<number> {
+  const token = loadPeerToken();
   const url = `http://${peer.address}:${peer.port}/sync/facts`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}` },
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const facts = (await res.json()) as Array<{ key: string; value: string }>;
   const local = new Set(getAllFacts().map((f) => f.key));
@@ -191,6 +197,7 @@ export async function listPeers(timeoutMs = 3000): Promise<PeerInfo[]> {
 export async function startPeerDaemon(port = 7474): Promise<void> {
   const identity = loadIdentity();
   const config = loadConfig();
+  const peerToken = loadPeerToken();
 
   // Advertise via mDNS
   const b = new Bonjour();
@@ -213,11 +220,44 @@ export async function startPeerDaemon(port = 7474): Promise<void> {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', `http://localhost:${port}`);
 
-    // CORS for dashboard usage
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    // CORS — restrict to localhost origins only (prevents cross-site requests)
+    const reqOrigin = req.headers['origin'];
+    const allowedPeerOrigins = new Set([
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+    ]);
+    const corsOrigin = reqOrigin && allowedPeerOrigins.has(reqOrigin) ? reqOrigin : null;
+    if (corsOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(corsOrigin ? 204 : 403);
+      res.end();
+      return;
+    }
+
+    // --- Bearer token auth (all routes except /status) ---
+    if (url.pathname !== '/status') {
+      const authHeader = req.headers['authorization'] ?? '';
+      const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (bearer !== peerToken) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+    }
+
+    // --- Rate limiting ---
+    const peerClientKey = req.socket.remoteAddress ?? 'unknown';
+    const peerLimiter = url.pathname === '/query' ? chatLimiter : apiLimiter;
+    if (!peerLimiter.consume(peerClientKey)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+      res.end(JSON.stringify({ error: 'Too Many Requests' }));
+      return;
+    }
 
     // --- GET /status ---
     if (req.method === 'GET' && url.pathname === '/status') {

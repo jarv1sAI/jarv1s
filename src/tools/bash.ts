@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import * as readline from 'readline';
+import { type ConfirmationBroker, defaultBroker } from './confirmation.js';
 
 const MAX_OUTPUT_LENGTH = 4000;
 
@@ -7,26 +7,18 @@ export interface BashExecInput {
   command: string;
 }
 
-async function promptUser(question: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+// Module-level broker — overridden by initToolConfig() for dashboard context
+let _broker: ConfirmationBroker = defaultBroker();
 
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase().trim());
-    });
-  });
+export function setBashBroker(broker: ConfirmationBroker): void {
+  _broker = broker;
 }
 
 export async function bashExec(input: BashExecInput): Promise<string> {
   const { command } = input;
 
-  const answer = await promptUser(`[JARVIS] Run: \`${command}\`? (y/n) `);
-
-  if (answer !== 'y' && answer !== 'yes') {
+  const approved = await _broker.ask(`[JARVIS] Run: \`${command}\`? (y/n) `);
+  if (!approved) {
     return 'Command execution cancelled by user.';
   }
 

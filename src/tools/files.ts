@@ -1,7 +1,19 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
-import * as readline from 'readline';
+import { checkPathAllowed } from './pathguard.js';
+import { type ConfirmationBroker, defaultBroker } from './confirmation.js';
 
 const MAX_FILE_LENGTH = 8000;
+
+// Injected at startup via initToolConfig() in tools/index.ts
+let _allowedPaths: string[] | undefined;
+export function setFilesAllowedPaths(paths: string[] | undefined): void {
+  _allowedPaths = paths;
+}
+
+let _broker: ConfirmationBroker = defaultBroker();
+export function setFilesBroker(broker: ConfirmationBroker): void {
+  _broker = broker;
+}
 
 export interface ReadFileInput {
   path: string;
@@ -12,22 +24,11 @@ export interface WriteFileInput {
   content: string;
 }
 
-async function promptUser(question: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase().trim());
-    });
-  });
-}
-
 export function readFile(input: ReadFileInput): string {
   const { path } = input;
+
+  const guard = checkPathAllowed(path, _allowedPaths);
+  if (guard) return guard;
 
   try {
     if (!existsSync(path)) {
@@ -48,12 +49,13 @@ export function readFile(input: ReadFileInput): string {
 export async function writeFile(input: WriteFileInput): Promise<string> {
   const { path, content } = input;
 
+  const guard = checkPathAllowed(path, _allowedPaths);
+  if (guard) return guard;
+
   try {
     if (existsSync(path)) {
-      const answer = await promptUser(
-        `[JARVIS] File exists: ${path}. Overwrite? (y/n) `
-      );
-      if (answer !== 'y' && answer !== 'yes') {
+      const approved = await _broker.ask(`[JARVIS] File exists: ${path}. Overwrite? (y/n) `);
+      if (!approved) {
         return 'Write operation cancelled by user.';
       }
     }

@@ -1,9 +1,52 @@
+import { promises as dns } from 'dns';
+
 const MAX_CONTENT = 8000;
 
 export interface WebFetchInput {
   url: string;
   selector?: string;
 }
+
+// ---------------------------------------------------------------------------
+// SSRF protection — block private / link-local / loopback IP ranges
+// ---------------------------------------------------------------------------
+
+const PRIVATE_RANGES: RegExp[] = [
+  /^127\./,                        // loopback IPv4
+  /^0\./,                          // "this" network
+  /^10\./,                         // RFC 1918 class A
+  /^172\.(1[6-9]|2\d|3[01])\./,   // RFC 1918 class B
+  /^192\.168\./,                   // RFC 1918 class C
+  /^169\.254\./,                   // link-local / cloud IMDS
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,  // CGNAT RFC 6598
+  /^::1$/,                         // IPv6 loopback
+  /^fc[0-9a-f]{2}:/i,              // IPv6 ULA
+  /^fe80:/i,                       // IPv6 link-local
+  /^fd[0-9a-f]{2}:/i,              // IPv6 ULA
+];
+
+async function isPrivateAddress(hostname: string): Promise<boolean> {
+  // Reject bare IP literals that match private ranges without DNS lookup
+  for (const re of PRIVATE_RANGES) {
+    if (re.test(hostname)) return true;
+  }
+
+  try {
+    const result = await dns.lookup(hostname, { all: true });
+    for (const { address } of result) {
+      for (const re of PRIVATE_RANGES) {
+        if (re.test(address)) return true;
+      }
+    }
+  } catch {
+    // DNS failure — block rather than allow
+    return true;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 
 function stripHtml(html: string): string {
   return html
@@ -33,6 +76,11 @@ export async function webFetch(input: WebFetchInput): Promise<string> {
 
   if (!['http:', 'https:'].includes(parsed.protocol)) {
     return `Error: Only http/https URLs are supported`;
+  }
+
+  // SSRF protection — resolve hostname and block private addresses
+  if (await isPrivateAddress(parsed.hostname)) {
+    return `Error: Requests to private, loopback, or link-local addresses are not allowed`;
   }
 
   try {
@@ -82,3 +130,6 @@ export const webFetchDefinition = {
     required: ['url'],
   },
 };
+
+// Export SSRF checker so browser tool and peer handoff can reuse it
+export { isPrivateAddress };

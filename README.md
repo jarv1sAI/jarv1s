@@ -44,7 +44,7 @@ JARV1S is a CLI AI assistant that runs on your machine. It maintains a persisten
 - **Iron Man HUD Dashboard** — local browser UI with arc reactor orb, live stats, streaming chat, peer management, and portability controls
 - **Local Network Peers** — discover and query other JARVIS instances on the LAN via mDNS, no config needed
 - **Portability** — export full identity + memory to a `.jarvis.bundle` file; import on any device; live sync from a running peer
-- **Two Providers** — Ollama (local, default) or subprocess (pipe through any CLI tool that already has its own auth — zero API keys in JARVIS)
+- **Three Providers** — Ollama (local, default), any OpenAI-compatible API (Hugging Face, Groq, Together, Mistral, Fireworks, LM Studio, OpenAI), or subprocess (pipe through any CLI — zero API keys stored)
 - **Project Awareness** — auto-detects project type and git state, injects into context
 - **Safe by Default** — bash commands and file overwrites require explicit confirmation
 - **Sensitive Data Redaction** — strips API keys and tokens before sending to the model
@@ -59,7 +59,7 @@ JARV1S is a CLI AI assistant that runs on your machine. It maintains a persisten
 | Node.js | 20.0.0+ |
 | RAM | 512 MB |
 | Disk | 100 MB |
-| API Key | None required for Ollama or subprocess |
+| API Key | None required for Ollama or subprocess; required for `openai` provider |
 
 ---
 
@@ -349,15 +349,10 @@ All runtime data is stored locally in `~/.jarvis/`:
 On first run, JARV1S creates `~/.jarvis/config/jarvis.yaml`:
 
 ```yaml
-# Provider: ollama | subprocess
+# Provider: ollama | openai | subprocess
 provider: ollama
 
-# Model (for Ollama)
 model: llama3.2
-
-# Optional: override the Ollama endpoint
-# base_url: http://localhost:11434/v1
-
 max_tokens: 8096
 stream: true
 ```
@@ -367,6 +362,7 @@ stream: true
 | Provider | Description | Key required |
 |----------|-------------|:---:|
 | `ollama` | Local models via [Ollama](https://ollama.com) — default | No |
+| `openai` | Any OpenAI-compatible API — Hugging Face, Groq, Together, Mistral, Fireworks, LM Studio, OpenAI | Yes |
 | `subprocess` | Pipe through any local CLI that already has its own auth | No |
 
 #### Ollama (default)
@@ -382,6 +378,72 @@ model: llama3.2
 ```
 
 Recommended models for tool use: `llama3.2`, `qwen2.5`, `mistral-nemo`, `gemma3`.
+
+#### openai — any OpenAI-compatible API
+
+The `openai` provider works with any service that exposes an OpenAI-compatible endpoint. Set `base_url` to point at any provider and supply an API key.
+
+**Hugging Face** (open-source models):
+
+```yaml
+provider: openai
+base_url: https://api-inference.huggingface.co/v1
+api_key: hf_...         # or set HF_TOKEN env var
+model: meta-llama/Llama-3.3-70B-Instruct
+```
+
+**Groq** (fast inference):
+
+```yaml
+provider: openai
+base_url: https://api.groq.com/openai/v1
+api_key: gsk_...        # or set GROQ_API_KEY env var
+model: llama-3.3-70b-versatile
+```
+
+**Together AI**:
+
+```yaml
+provider: openai
+base_url: https://api.together.xyz/v1
+api_key: ...            # or set TOGETHER_API_KEY env var
+model: meta-llama/Llama-3.3-70B-Instruct-Turbo
+```
+
+**Mistral**:
+
+```yaml
+provider: openai
+base_url: https://api.mistral.ai/v1
+api_key: ...            # or set MISTRAL_API_KEY env var
+model: mistral-small-latest
+```
+
+**Fireworks AI**:
+
+```yaml
+provider: openai
+base_url: https://api.fireworks.ai/inference/v1
+api_key: fw_...         # or set FIREWORKS_API_KEY env var
+model: accounts/fireworks/models/llama-v3p3-70b-instruct
+```
+
+**LM Studio** (local, no key needed):
+
+```yaml
+provider: openai
+base_url: http://localhost:1234/v1
+model: lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF
+```
+
+**OpenAI**:
+
+```yaml
+provider: openai
+# base_url defaults to https://api.openai.com/v1 when omitted
+api_key: sk-...         # or set OPENAI_API_KEY env var
+model: gpt-4o-mini
+```
 
 #### subprocess — use any local agent's existing auth
 
@@ -420,10 +482,16 @@ jarvis --provider subprocess "explain this code"
 
 | Variable | Description |
 |----------|-------------|
-| `JARVIS_PROVIDER` | Override the provider (`ollama` or `subprocess`) |
+| `JARVIS_PROVIDER` | Override the provider (`ollama`, `openai`, or `subprocess`) |
 | `JARVIS_MODEL` | Override the model |
-| `JARVIS_BASE_URL` | Override the Ollama API endpoint |
-| `JARVIS_API_KEY` | API key override (if your Ollama instance requires one) |
+| `JARVIS_BASE_URL` | Override the API endpoint |
+| `JARVIS_API_KEY` | API key (highest priority) |
+| `HF_TOKEN` | Hugging Face API token |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `GROQ_API_KEY` | Groq API key |
+| `TOGETHER_API_KEY` | Together AI API key |
+| `MISTRAL_API_KEY` | Mistral API key |
+| `FIREWORKS_API_KEY` | Fireworks AI API key |
 
 Run `jarvis doctor` at any time to check configuration, storage health, and tool availability.
 

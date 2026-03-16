@@ -18,11 +18,14 @@ Usage:
 
   jarvis export [--out <file>]        Export full identity + memory to a bundle file
                [--no-history]         Exclude conversation history from bundle
+               [--passphrase <s>]     Encrypt bundle with AES-256-GCM (PBKDF2-derived key)
   jarvis import <file>                Import a bundle onto this device (merge)
                [--adopt-identity]     Adopt the bundle's agent ID (same identity across devices)
                [--no-history]         Skip importing conversation history
                [--no-config]          Skip importing jarvis.yaml
+               [--passphrase <s>]     Decrypt an encrypted bundle
 
+  jarvis daemon                       Run scheduled tasks (from jarvis.yaml scheduled_tasks)
   jarvis peer [--port N]              Start peer daemon (default port 7474)
   jarvis peers                        List JARVIS instances on the local network
   jarvis ask <host:port> <query>      Send a query to a peer instance
@@ -164,17 +167,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  // --model and --provider flags
+  // --- scheduled task daemon ---
+  if (args[0] === 'daemon') {
+    await runAgent(undefined, { daemon: true });
+    return;
+  }
+
+  // --model / --provider / --daemon flags
   const modelIdx = args.indexOf('--model');
   const model = modelIdx !== -1 ? args[modelIdx + 1] : undefined;
   const providerIdx = args.indexOf('--provider');
   const provider = providerIdx !== -1 ? args[providerIdx + 1] : undefined;
+  const daemon = args.includes('--daemon');
 
   const flagPairs = new Set<number>();
   [modelIdx, providerIdx].forEach((i) => { if (i !== -1) { flagPairs.add(i); flagPairs.add(i + 1); } });
-  const queryArgs = args.filter((_, i) => !flagPairs.has(i));
+  const queryArgs = args.filter((_, i) => !flagPairs.has(i) && args[i] !== '--daemon');
 
-  if (queryArgs.length > 0) {
+  if (daemon) {
+    await runAgent(undefined, { model, provider, daemon: true });
+  } else if (queryArgs.length > 0) {
     await runAgent(queryArgs.join(' '), { model, provider });
   } else {
     await runAgent(undefined, { model, provider });

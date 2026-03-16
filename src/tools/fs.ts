@@ -1,6 +1,13 @@
 import { readdirSync, statSync, existsSync } from 'fs';
 import { join, relative } from 'path';
 import { execSync } from 'child_process';
+import { checkPathAllowed } from './pathguard.js';
+
+// Injected at startup via setToolConfig() in tools/index.ts
+let _allowedPaths: string[] | undefined;
+export function setFsAllowedPaths(paths: string[] | undefined): void {
+  _allowedPaths = paths;
+}
 
 // ---------------------------------------------------------------------------
 // list_directory
@@ -13,6 +20,9 @@ export interface ListDirectoryInput {
 
 export function listDirectory(input: ListDirectoryInput): string {
   const { path, recursive = false } = input;
+
+  const guard = checkPathAllowed(path, _allowedPaths);
+  if (guard) return guard;
 
   if (!existsSync(path)) return `Error: Path not found: ${path}`;
 
@@ -74,6 +84,9 @@ export interface SearchFilesInput {
 export function searchFiles(input: SearchFilesInput): string {
   const { pattern, path: searchPath = '.', type = 'text' } = input;
 
+  const guard = checkPathAllowed(searchPath, _allowedPaths);
+  if (guard) return guard;
+
   if (!existsSync(searchPath)) return `Error: Path not found: ${searchPath}`;
 
   const MAX_OUTPUT = 4000;
@@ -82,13 +95,11 @@ export function searchFiles(input: SearchFilesInput): string {
     let result: string;
 
     if (type === 'glob') {
-      // Use find for glob-style file matching
       result = execSync(`find ${JSON.stringify(searchPath)} -name ${JSON.stringify(pattern)} -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null`, {
         encoding: 'utf-8',
         timeout: 15000,
       }).trim();
     } else {
-      // Text search with grep
       result = execSync(
         `grep -r --include='*' -l ${JSON.stringify(pattern)} ${JSON.stringify(searchPath)} 2>/dev/null | grep -v node_modules | grep -v '.git'`,
         { encoding: 'utf-8', timeout: 15000 },
@@ -102,7 +113,6 @@ export function searchFiles(input: SearchFilesInput): string {
     return result;
   } catch (err: unknown) {
     const e = err as { stdout?: string; stderr?: string; message?: string };
-    // grep exits 1 when no matches found — that's not an error
     if (e.stdout !== undefined && !e.stdout.trim()) return `No matches found for "${pattern}" in ${searchPath}`;
     return `Error searching files: ${e.message ?? String(err)}`;
   }

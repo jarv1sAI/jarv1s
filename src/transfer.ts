@@ -21,8 +21,9 @@
 import { createGzip, gunzipSync } from 'zlib';
 import { createWriteStream, existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync } from 'crypto';
 import Database from 'better-sqlite3';
-import { loadIdentity, DIRS, getMemoryDir } from './identity.js';
+import { loadIdentity, DIRS, getMemoryDir, getConfigDir, loadPeerToken } from './identity.js';
 import {
   getAllFacts,
   getAllMessages,
@@ -31,7 +32,61 @@ import {
   appendToJarvisMd,
   closeDb,
 } from './memory.js';
-import { getConfigDir } from './identity.js';
+import { sanitizeMemoryContent, sanitizeFactValue } from './sanitize.js';
+
+// ---------------------------------------------------------------------------
+// Encryption helpers (AES-256-GCM, PBKDF2-derived key)
+// ---------------------------------------------------------------------------
+
+const PBKDF2_ITERATIONS = 210_000;
+const PBKDF2_KEYLEN = 32; // 256-bit
+const PBKDF2_DIGEST = 'sha256';
+
+function deriveKey(passphrase: string, salt: Buffer): Buffer {
+  return pbkdf2Sync(passphrase, salt, PBKDF2_ITERATIONS, PBKDF2_KEYLEN, PBKDF2_DIGEST);
+}
+
+function encryptJson(plaintext: string, passphrase: string): string {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12); // 96-bit IV for GCM
+  const key = deriveKey(passphrase, salt);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const payload = JSON.stringify({
+    enc: true,
+    salt: salt.toString('hex'),
+    iv: iv.toString('hex'),
+    tag: authTag.toString('hex'),
+    ct: encrypted.toString('hex'),
+  });
+  return payload;
+}
+
+function decryptJson(payload: string, passphrase: string): string {
+  let obj: { enc?: boolean; salt?: string; iv?: string; tag?: string; ct?: string };
+  try {
+    obj = JSON.parse(payload) as typeof obj;
+  } catch {
+    throw new Error('Bundle is not valid JSON — wrong passphrase or corrupted file?');
+  }
+  if (!obj.enc || !obj.salt || !obj.iv || !obj.tag || !obj.ct) {
+    throw new Error('Bundle does not appear to be encrypted');
+  }
+  const salt = Buffer.from(obj.salt, 'hex');
+  const iv = Buffer.from(obj.iv, 'hex');
+  const tag = Buffer.from(obj.tag, 'hex');
+  const ct = Buffer.from(obj.ct, 'hex');
+  const key = deriveKey(passphrase, salt);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  try {
+    const decrypted = Buffer.concat([decipher.update(ct), decipher.final()]);
+    return decrypted.toString('utf-8');
+  } catch {
+    throw new Error('Decryption failed — wrong passphrase or corrupted file');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,7 +119,7 @@ interface JarvisBundle {
 // Export
 // ---------------------------------------------------------------------------
 
-export async function exportBundle(opts: { out?: string; noHistory?: boolean } = {}): Promise<string> {
+export async function exportBundle(opts: { out?: string; noHistory?: boolean; passphrase?: string } = {}): Promise<string> {
   const identity = loadIdentity();
   const facts = getAllFacts().map(({ key, value, created_at }) => ({ key, value, created_at }));
   const memory = loadJarvisMd();
@@ -83,10 +138,11 @@ export async function exportBundle(opts: { out?: string; noHistory?: boolean } =
     config,
   };
 
-  const json = JSON.stringify(bundle, null, 2);
+  const plaintext = JSON.stringify(bundle, null, 2);
+  const payload = opts.passphrase ? encryptJson(plaintext, opts.passphrase) : plaintext;
   const outPath = opts.out ?? join(process.cwd(), `jarvis-${identity.id.slice(7, 19)}-${Date.now()}.jarvis.bundle`);
 
-  // Write gzip-compressed bundle
+  // Write gzip-compressed bundle (plaintext or encrypted JSON payload)
   await new Promise<void>((resolve, reject) => {
     const gz = createGzip();
     const out = createWriteStream(outPath);
@@ -94,7 +150,7 @@ export async function exportBundle(opts: { out?: string; noHistory?: boolean } =
     out.on('error', reject);
     out.on('finish', resolve);
     gz.pipe(out);
-    gz.write(json);
+    gz.write(payload);
     gz.end();
   });
 
@@ -116,11 +172,11 @@ export interface ImportResult {
 
 export async function importBundle(
   filePath: string,
-  opts: { adoptIdentity?: boolean; noHistory?: boolean; noConfig?: boolean } = {},
+  opts: { adoptIdentity?: boolean; noHistory?: boolean; noConfig?: boolean; passphrase?: string } = {},
 ): Promise<ImportResult> {
   if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
 
-  const json = readGzipJson(filePath);
+  const json = readGzipJson(filePath, opts.passphrase);
   const bundle = json as JarvisBundle;
 
   if (!bundle.version || !bundle.identity?.id) {
@@ -136,22 +192,23 @@ export async function importBundle(
     identityAdopted: false,
   };
 
-  // Facts — no-overwrite merge
+  // Facts — no-overwrite merge (values sanitized before storage)
   const localKeys = new Set(getAllFacts().map((f) => f.key));
   for (const { key, value } of bundle.facts) {
     if (localKeys.has(key)) {
       result.factsSkipped++;
     } else {
-      saveFact(key, value);
+      saveFact(key, sanitizeFactValue(value));
       result.factsImported++;
     }
   }
 
-  // JARVIS.md — append bundle memory under a separator if local has content
+  // JARVIS.md — append sanitized bundle memory under a separator
   if (bundle.memory) {
+    const sanitized = sanitizeMemoryContent(bundle.memory);
     const localMemory = loadJarvisMd();
-    if (!localMemory.includes(bundle.memory.trim().slice(0, 80))) {
-      appendToJarvisMd(`\n\n---\n<!-- Imported from ${bundle.identity.id} on ${new Date().toISOString()} -->\n${bundle.memory}`);
+    if (!localMemory.includes(sanitized.trim().slice(0, 80))) {
+      appendToJarvisMd(`\n\n---\n<!-- Imported from ${bundle.identity.id} on ${new Date().toISOString()} -->\n${sanitized}`);
       result.memoryMerged = true;
     }
   }
@@ -198,9 +255,11 @@ export interface SyncResult {
 
 export async function syncFromPeer(address: string, port: number): Promise<SyncResult> {
   const base = `http://${address}:${port}`;
+  const token = loadPeerToken();
+  const authHeaders = { 'Authorization': `Bearer ${token}` };
 
   // Fetch facts
-  const factsRes = await fetch(`${base}/sync/facts`, { signal: AbortSignal.timeout(10_000) });
+  const factsRes = await fetch(`${base}/sync/facts`, { headers: authHeaders, signal: AbortSignal.timeout(10_000) });
   if (!factsRes.ok) throw new Error(`Peer /sync/facts returned HTTP ${factsRes.status}`);
   const remoteFacts = (await factsRes.json()) as Array<{ key: string; value: string }>;
 
@@ -208,24 +267,25 @@ export async function syncFromPeer(address: string, port: number): Promise<SyncR
   let factsImported = 0, factsSkipped = 0;
   for (const { key, value } of remoteFacts) {
     if (localKeys.has(key)) { factsSkipped++; }
-    else { saveFact(key, value); factsImported++; }
+    else { saveFact(key, sanitizeFactValue(value)); factsImported++; }
   }
 
   // Fetch JARVIS.md
   let memoryMerged = false;
-  const memRes = await fetch(`${base}/sync/memory`, { signal: AbortSignal.timeout(10_000) });
+  const memRes = await fetch(`${base}/sync/memory`, { headers: authHeaders, signal: AbortSignal.timeout(10_000) });
   if (memRes.ok) {
     const remoteMemory = await memRes.text();
+    const sanitized = sanitizeMemoryContent(remoteMemory);
     const localMemory = loadJarvisMd();
-    if (remoteMemory.trim() && !localMemory.includes(remoteMemory.trim().slice(0, 80))) {
-      appendToJarvisMd(`\n\n---\n<!-- Synced from ${address}:${port} on ${new Date().toISOString()} -->\n${remoteMemory}`);
+    if (sanitized.trim() && !localMemory.includes(sanitized.trim().slice(0, 80))) {
+      appendToJarvisMd(`\n\n---\n<!-- Synced from ${address}:${port} on ${new Date().toISOString()} -->\n${sanitized}`);
       memoryMerged = true;
     }
   }
 
   // Fetch history
   let historyImported = 0;
-  const histRes = await fetch(`${base}/sync/history`, { signal: AbortSignal.timeout(15_000) });
+  const histRes = await fetch(`${base}/sync/history`, { headers: authHeaders, signal: AbortSignal.timeout(15_000) });
   if (histRes.ok) {
     const remoteHistory = (await histRes.json()) as BundleMessage[];
     const localMsgs = new Set(
@@ -247,10 +307,18 @@ export async function syncFromPeer(address: string, port: number): Promise<SyncR
 // Helpers
 // ---------------------------------------------------------------------------
 
-function readGzipJson(filePath: string): unknown {
+function readGzipJson(filePath: string, passphrase?: string): unknown {
   const compressed = readFileSync(filePath);
-  const decompressed = gunzipSync(compressed);
-  return JSON.parse(decompressed.toString('utf-8'));
+  const decompressed = gunzipSync(compressed).toString('utf-8');
+
+  // Detect encrypted payload: starts with {"enc":true,...}
+  const trimmed = decompressed.trimStart();
+  if (trimmed.startsWith('{"enc":true') || trimmed.startsWith('{"enc": true')) {
+    if (!passphrase) throw new Error('Bundle is encrypted — provide --passphrase <phrase> to decrypt');
+    return JSON.parse(decryptJson(decompressed, passphrase));
+  }
+
+  return JSON.parse(decompressed);
 }
 
 /**
@@ -276,26 +344,31 @@ export async function runExport(args: string[]): Promise<void> {
   const outIdx = args.indexOf('--out');
   const out = outIdx !== -1 ? args[outIdx + 1] : undefined;
   const noHistory = args.includes('--no-history');
+  const passphraseIdx = args.indexOf('--passphrase');
+  const passphrase = passphraseIdx !== -1 ? args[passphraseIdx + 1] : undefined;
 
   process.stdout.write('Packing bundle…\n');
-  const filePath = await exportBundle({ out, noHistory });
+  const filePath = await exportBundle({ out, noHistory, passphrase });
   const { statSync } = await import('fs');
   const size = Math.round(statSync(filePath).size / 1024);
   console.log(`Bundle saved: ${filePath} (${size} KB)`);
   if (noHistory) console.log('Note: conversation history excluded (--no-history)');
+  if (passphrase) console.log('Note: bundle is AES-256-GCM encrypted');
   closeDb();
 }
 
 export async function runImport(args: string[]): Promise<void> {
   const filePath = args[0];
-  if (!filePath) { console.error('Usage: jarvis import <file.jarvis.bundle> [--adopt-identity] [--no-history] [--no-config]'); process.exit(1); }
+  if (!filePath) { console.error('Usage: jarvis import <file.jarvis.bundle> [--adopt-identity] [--no-history] [--no-config] [--passphrase <phrase>]'); process.exit(1); }
 
   const adoptIdentity = args.includes('--adopt-identity');
   const noHistory = args.includes('--no-history');
   const noConfig = args.includes('--no-config');
+  const passphraseIdx = args.indexOf('--passphrase');
+  const passphrase = passphraseIdx !== -1 ? args[passphraseIdx + 1] : undefined;
 
   process.stdout.write(`Importing from ${filePath}…\n`);
-  const result = await importBundle(filePath, { adoptIdentity, noHistory, noConfig });
+  const result = await importBundle(filePath, { adoptIdentity, noHistory, noConfig, passphrase });
 
   console.log(`\nImport complete:`);
   console.log(`  Facts imported  : ${result.factsImported}`);
