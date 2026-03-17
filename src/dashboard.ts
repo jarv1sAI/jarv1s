@@ -12,16 +12,39 @@ import { statSync, existsSync, readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import OpenAI from 'openai';
+import { WebSocketServer } from 'ws';
 import {
   getAllMessages, getAllFacts, getSessionIds,
-  deleteFact, saveMessage, getRecentMessages, loadJarvisMd,
+  deleteFact, saveMessage, getRecentMessages, loadJarvisMd, getAuditLog,
 } from './memory.js';
 import { loadIdentity, getMemoryDir } from './identity.js';
 import { loadConfig } from './config.js';
 import { startDiscovery, stopDiscovery, getDiscoveredPeers, askPeer } from './peer.js';
 import { exportBundle, syncFromPeer } from './transfer.js';
+import { initToolConfig, setBashBroker, setFilesBroker } from './tools/index.js';
+import { apiLimiter, chatLimiter } from './ratelimit.js';
+import { WsDashboardBroker } from './tools/confirmation.js';
 
 const DEFAULT_PORT = 4444;
+
+// ---------------------------------------------------------------------------
+// CORS — locked to localhost only (set once server binds its port)
+// ---------------------------------------------------------------------------
+
+/** Allowed Origin values: populated when the server binds. */
+let _allowedOrigins: Set<string> = new Set();
+
+/**
+ * Returns the request's Origin if it is in the allowlist, otherwise null.
+ * Requests with no Origin header (same-origin navigations, curl, etc.) are
+ * permitted when the server is bound to 127.0.0.1 — they cannot be CSRF-driven
+ * cross-origin requests by definition.
+ */
+function getAllowedOrigin(req: http.IncomingMessage): string | null {
+  const origin = req.headers['origin'];
+  if (!origin) return null;               // no Origin → not a cross-origin request
+  return _allowedOrigins.has(origin) ? origin : null;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,11 +59,15 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function json(res: http.ServerResponse, data: unknown, status = 200): void {
+function json(res: http.ServerResponse, req: http.IncomingMessage, data: unknown, status = 200): void {
+  const origin = getAllowedOrigin(req);
+  const corsHeaders: Record<string, string> = origin
+    ? { 'Access-Control-Allow-Origin': origin, 'Vary': 'Origin' }
+    : {};
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
     'Cache-Control': 'no-cache',
+    ...corsHeaders,
   });
   res.end(JSON.stringify(data));
 }
@@ -61,29 +88,29 @@ function handleApi(req: http.IncomingMessage, res: http.ServerResponse): boolean
     const msgs = getAllMessages(9999);
     const dbPath = join(getMemoryDir(), 'interactions.db');
     const dbSize = existsSync(dbPath) ? statSync(dbPath).size : 0;
-    json(res, {
+    json(res, req, {
       identity,
-      config: { provider: config.provider, model: config.model, base_url: config.base_url },
+      config: { provider: config.provider, model: config.model, base_url: config.base_url, personality: config.personality ?? 'general' },
       stats: { facts: facts.length, sessions: sessions.length, messages: msgs.length, dbSizeKb: Math.round(dbSize / 1024) },
     });
     return true;
   }
 
-  if (url === '/api/facts' && method === 'GET') { json(res, getAllFacts()); return true; }
+  if (url === '/api/facts' && method === 'GET') { json(res, req, getAllFacts()); return true; }
 
   if (url.startsWith('/api/facts/') && method === 'DELETE') {
     const key = decodeURIComponent(url.slice('/api/facts/'.length));
     const deleted = deleteFact(key);
-    json(res, { deleted, key }, deleted ? 200 : 404);
+    json(res, req, { deleted, key }, deleted ? 200 : 404);
     return true;
   }
 
-  if (url === '/api/history' && method === 'GET') { json(res, getAllMessages(300)); return true; }
+  if (url === '/api/history' && method === 'GET') { json(res, req, getAllMessages(300)); return true; }
 
   if (url === '/api/sessions' && method === 'GET') {
     const ids = getSessionIds();
     const msgs = getAllMessages(9999);
-    json(res, ids.map((id) => ({
+    json(res, req, ids.map((id) => ({
       id,
       count: msgs.filter((m) => m.session_id === id).length,
       last: msgs.filter((m) => m.session_id === id).at(-1)?.timestamp ?? null,
@@ -94,9 +121,11 @@ function handleApi(req: http.IncomingMessage, res: http.ServerResponse): boolean
   if (url === '/api/chat' && method === 'POST') { void handleChatStream(req, res); return true; }
 
   if (url === '/api/peers' && method === 'GET') {
-    json(res, getDiscoveredPeers());
+    json(res, req, getDiscoveredPeers());
     return true;
   }
+
+  if (url === '/api/audit' && method === 'GET') { json(res, req, getAuditLog()); return true; }
 
   // POST /api/peer-query — stream a query to a peer via SSE
   if (url === '/api/peer-query' && method === 'POST') {
@@ -113,15 +142,16 @@ function handleApi(req: http.IncomingMessage, res: http.ServerResponse): boolean
         await exportBundle({ out: tmpPath, noHistory });
         const data = readFileSync(tmpPath);
         unlinkSync(tmpPath);
+        const exportOrigin = getAllowedOrigin(req);
         res.writeHead(200, {
           'Content-Type': 'application/octet-stream',
           'Content-Disposition': `attachment; filename="jarvis.jarvis.bundle"`,
           'Content-Length': data.length,
-          'Access-Control-Allow-Origin': '*',
+          ...(exportOrigin ? { 'Access-Control-Allow-Origin': exportOrigin, 'Vary': 'Origin' } : {}),
         });
         res.end(data);
       } catch (err: unknown) {
-        json(res, { error: (err as { message?: string }).message ?? 'Export failed' }, 500);
+        json(res, req, { error: (err as { message?: string }).message ?? 'Export failed' }, 500);
       }
     })();
     return true;
@@ -131,14 +161,14 @@ function handleApi(req: http.IncomingMessage, res: http.ServerResponse): boolean
   if (url === '/api/sync' && method === 'POST') {
     void (async () => {
       let body: { address?: string; port?: number } = {};
-      try { body = JSON.parse(await readBody(req)) as typeof body; } catch { json(res, { error: 'invalid JSON' }, 400); return; }
+      try { body = JSON.parse(await readBody(req)) as typeof body; } catch { json(res, req, { error: 'invalid JSON' }, 400); return; }
       const { address, port } = body;
-      if (!address || !port) { json(res, { error: 'address and port required' }, 400); return; }
+      if (!address || !port) { json(res, req, { error: 'address and port required' }, 400); return; }
       try {
         const result = await syncFromPeer(address, port);
-        json(res, result);
+        json(res, req, result);
       } catch (err: unknown) {
-        json(res, { error: (err as { message?: string }).message ?? 'Sync failed' }, 500);
+        json(res, req, { error: (err as { message?: string }).message ?? 'Sync failed' }, 500);
       }
     })();
     return true;
@@ -158,11 +188,12 @@ async function handleChatStream(req: http.IncomingMessage, res: http.ServerRespo
   const userMessage = (body.message ?? '').trim();
   if (!userMessage) { res.writeHead(400); res.end(); return; }
 
+  const chatOrigin = getAllowedOrigin(req);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
+    ...(chatOrigin ? { 'Access-Control-Allow-Origin': chatOrigin, 'Vary': 'Origin' } : {}),
   });
   res.flushHeaders();
 
@@ -194,8 +225,9 @@ async function handleChatStream(req: http.IncomingMessage, res: http.ServerRespo
 
       let fullResponse = '';
       await new Promise<void>((resolve, reject) => {
-        const escapedPrompt = fullPrompt.replace(/'/g, `'\\''`);
-        const child = spawn('bash', ['-c', `${cmd} '${escapedPrompt}'`], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // Split cmd into executable + fixed args; append prompt as a separate arg (no shell).
+        const parts = cmd.trim().split(/\s+/);
+        const child = spawn(parts[0], [...parts.slice(1), fullPrompt], { stdio: ['ignore', 'pipe', 'pipe'] });
 
         child.stdout.on('data', (chunk: Buffer) => {
           const token = chunk.toString();
@@ -275,11 +307,12 @@ async function handlePeerQueryStream(req: http.IncomingMessage, res: http.Server
   const { address, port, query } = body;
   if (!address || !port || !query?.trim()) { res.writeHead(400); res.end(); return; }
 
+  const peerOrigin = getAllowedOrigin(req);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
+    ...(peerOrigin ? { 'Access-Control-Allow-Origin': peerOrigin, 'Vary': 'Origin' } : {}),
   });
   res.flushHeaders();
 
@@ -1046,9 +1079,46 @@ async function init(){
     // Background peer discovery
     void refreshPeers();
     setInterval(()=>void refreshPeers(),10000);
+
+    // WebSocket confirmation channel
+    initConfirmWs();
   }catch(e){
     document.getElementById('status-text').textContent='OFFLINE';
     console.error(e);
+  }
+}
+
+// ── WebSocket confirmation channel ────────────
+let _ws=null;
+function initConfirmWs(){
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  _ws=new WebSocket(proto+'//'+location.host+'/ws');
+  _ws.addEventListener('message',e=>{
+    try{
+      const msg=JSON.parse(e.data);
+      if(msg.type==='confirm_request') showConfirmModal(msg.id,msg.prompt);
+    }catch{}
+  });
+  _ws.addEventListener('close',()=>{
+    // Reconnect after 3s
+    setTimeout(initConfirmWs,3000);
+  });
+}
+
+function showConfirmModal(id,prompt){
+  const overlay=document.getElementById('confirm-overlay');
+  const promptEl=document.getElementById('confirm-prompt');
+  promptEl.textContent=prompt;
+  overlay.style.display='flex';
+  overlay.dataset.confirmId=id;
+}
+
+function confirmRespond(approved){
+  const overlay=document.getElementById('confirm-overlay');
+  const id=parseInt(overlay.dataset.confirmId,10);
+  overlay.style.display='none';
+  if(_ws&&_ws.readyState===WebSocket.OPEN){
+    _ws.send(JSON.stringify({type:'confirm_response',id,approved}));
   }
 }
 
@@ -1426,6 +1496,18 @@ async function runSync(){
 
 init();
 </script>
+
+<!-- Confirmation modal -->
+<div id="confirm-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
+  <div style="background:#0d1117;border:1px solid var(--cyan);border-radius:8px;padding:28px 32px;max-width:480px;width:90%;box-shadow:0 0 32px rgba(0,240,255,.18);">
+    <div style="color:var(--cyan);font-size:11px;letter-spacing:.12em;margin-bottom:12px;">⚠ CONFIRMATION REQUIRED</div>
+    <div id="confirm-prompt" style="color:var(--text);font-size:13px;line-height:1.55;margin-bottom:20px;white-space:pre-wrap;"></div>
+    <div style="display:flex;gap:12px;justify-content:flex-end;">
+      <button onclick="confirmRespond(false)" style="padding:7px 20px;border-radius:4px;border:1px solid var(--danger);background:transparent;color:var(--danger);cursor:pointer;font-size:12px;letter-spacing:.08em;">DENY</button>
+      <button onclick="confirmRespond(true)"  style="padding:7px 20px;border-radius:4px;border:1px solid var(--cyan);background:rgba(0,240,255,.08);color:var(--cyan);cursor:pointer;font-size:12px;letter-spacing:.08em;">APPROVE</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>`;
 
@@ -1434,16 +1516,33 @@ init();
 // ---------------------------------------------------------------------------
 
 export function startDashboard(port = DEFAULT_PORT): void {
+  const config = loadConfig();
+  // Start with DenyAllBroker; replaced per-connection by WsDashboardBroker when
+  // a browser opens the /ws endpoint.
+  initToolConfig(config.allowed_paths, true);
+
   const server = http.createServer((req, res) => {
     const method = req.method ?? 'GET';
 
     if (method === 'OPTIONS') {
+      const preflightOrigin = getAllowedOrigin(req);
+      if (!preflightOrigin) { res.writeHead(403); res.end(); return; }
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': preflightOrigin,
         'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
+        'Vary': 'Origin',
       });
       res.end();
+      return;
+    }
+
+    // Rate limiting — use the remote address as the bucket key
+    const clientKey = req.socket.remoteAddress ?? 'unknown';
+    const limiter = (req.url ?? '/').startsWith('/api/chat') ? chatLimiter : apiLimiter;
+    if (!limiter.consume(clientKey)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+      res.end(JSON.stringify({ error: 'Too Many Requests' }));
       return;
     }
 
@@ -1459,9 +1558,43 @@ export function startDashboard(port = DEFAULT_PORT): void {
     res.end('Not found');
   });
 
+  // ---------------------------------------------------------------------------
+  // WebSocket server — confirmation channel (same HTTP port via upgrade)
+  // ---------------------------------------------------------------------------
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url === '/ws') {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', (ws) => {
+    const broker = new WsDashboardBroker(ws);
+    setBashBroker(broker);
+    setFilesBroker(broker);
+    ws.on('close', () => {
+      // Revert to safe DenyAllBroker when browser disconnects
+      void import('./tools/confirmation.js').then(({ DenyAllBroker }) => {
+        setBashBroker(DenyAllBroker);
+        setFilesBroker(DenyAllBroker);
+      });
+    });
+  });
+
   startDiscovery();
 
   server.listen(port, '127.0.0.1', () => {
+    // Populate allowed origins now that the port is confirmed
+    _allowedOrigins = new Set([
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+    ]);
     console.log(`JARVIS Dashboard → http://127.0.0.1:${port}`);
     console.log('Press Ctrl+C to stop.');
   });

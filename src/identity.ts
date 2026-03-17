@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -96,4 +96,21 @@ export function getCheckpointsDir(): string {
 export function getConfigDir(): string {
   ensureDirectories();
   return DIRS.config;
+}
+
+const PEER_KEY_FILE = join(DIRS.identity, 'peer.key');
+
+/**
+ * Returns the peer daemon auth token, generating and persisting it on first call.
+ * The token is a 32-byte random hex string stored at ~/.jarvis/identity/peer.key.
+ * Keep this file private (chmod 600 is set on creation).
+ */
+export function loadPeerToken(): string {
+  ensureDirectories();
+  if (existsSync(PEER_KEY_FILE)) {
+    return readFileSync(PEER_KEY_FILE, 'utf-8').trim();
+  }
+  const token = randomBytes(32).toString('hex');
+  writeFileSync(PEER_KEY_FILE, token, { encoding: 'utf-8', mode: 0o600 });
+  return token;
 }

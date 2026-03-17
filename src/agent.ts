@@ -12,9 +12,15 @@ import {
   deleteFact,
   getAllMessages,
   closeDb,
+  getSessionSummary,
+  saveSessionSummary,
+  getSessionMessageCount,
+  getOrCreateSession,
+  SUMMARY_THRESHOLD,
 } from './memory.js';
-import { TOOLS, executeTool } from './tools/index.js';
-import { loadConfig, type JarvisConfig } from './config.js';
+import { getTools, executeTool, initToolConfig } from './tools/index.js';
+import { loadConfig, type JarvisConfig, type Personality } from './config.js';
+import { startScheduler, stopScheduler } from './scheduler.js';
 
 // ---------------------------------------------------------------------------
 // Retry
@@ -115,7 +121,33 @@ function buildProjectContext(): ProjectContext {
 // System prompt
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt(identity: Identity, ctx: ProjectContext): string {
+// ---------------------------------------------------------------------------
+// Personality instruction blocks
+// ---------------------------------------------------------------------------
+
+const PERSONALITY_INSTRUCTIONS: Record<Personality, string> = {
+  developer: `## Mode: Developer
+- Be terse and precise — code over prose
+- Reference project context, git branch, and file paths directly
+- Prefer short explanations with working code snippets
+- Skip pleasantries; jump straight to the solution
+- Use \`bash_exec\` freely for build/test/lint tasks`,
+
+  research: `## Mode: Research
+- Be thorough and cite sources when using \`web_fetch\` or \`web_search\`
+- Summarize findings clearly before diving into detail
+- Cross-reference multiple sources before drawing conclusions
+- Label estimates, projections, and opinions explicitly
+- Prefer exhaustive answers over terse ones`,
+
+  general: `## Mode: General
+- Be concise and direct in your responses
+- Balance depth with brevity based on the question
+- Use the \`remember\` tool proactively when the user shares something worth keeping
+- You have persistent memory across sessions — use it wisely`,
+};
+
+function buildSystemPrompt(identity: Identity, ctx: ProjectContext, personality: Personality = 'general'): string {
   const jarvisMd = loadJarvisMd();
   const facts = getAllFacts();
   const now = new Date().toLocaleString();
@@ -133,6 +165,8 @@ function buildSystemPrompt(identity: Identity, ctx: ProjectContext): string {
     factsSection = '\n## Known Facts\n' + facts.map((f) => `- ${f.key}: ${f.value}`).join('\n') + '\n';
   }
 
+  const personalityBlock = PERSONALITY_INSTRUCTIONS[personality] ?? PERSONALITY_INSTRUCTIONS.general;
+
   return `You are JARVIS, a local-first AI assistant.
 
 ## Identity
@@ -146,12 +180,11 @@ ${jarvisMd}
 ${factsSection}
 ${projectSection}
 
-## Instructions
-- Be concise and direct in your responses
-- Use the \`remember\` tool proactively when the user shares something worth keeping
+${personalityBlock}
+
+## Core Rules
 - Always ask before running potentially destructive bash commands
 - Use \`recall\` to search your memory when you need to reference past information
-- You have persistent memory across sessions — use it wisely
 - When working with code or files, use the project context above to orient yourself
 `;
 }
@@ -161,7 +194,7 @@ ${projectSection}
 // ---------------------------------------------------------------------------
 
 function buildOpenAITools(): OpenAI.Chat.ChatCompletionTool[] {
-  return TOOLS.map((t) => ({
+  return getTools().map((t) => ({
     type: 'function' as const,
     function: {
       name: t.name,
@@ -169,6 +202,69 @@ function buildOpenAITools(): OpenAI.Chat.ChatCompletionTool[] {
       parameters: t.input_schema,
     },
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Session summarization
+// ---------------------------------------------------------------------------
+
+/**
+ * If the current session has exceeded SUMMARY_THRESHOLD messages and no
+ * summary exists yet, ask the LLM to produce one and store it.
+ * Called once per session startup — fire-and-forget from the caller.
+ */
+async function maybeAutoSummarize(client: OpenAI, config: JarvisConfig): Promise<void> {
+  const sessionId = getOrCreateSession();
+  const count = getSessionMessageCount(sessionId);
+  if (count < SUMMARY_THRESHOLD) return;
+
+  const existing = getSessionSummary(sessionId);
+  // Only re-summarize when ≥20 new messages have arrived since last summary
+  if (existing && count - existing.message_count < 20) return;
+
+  const recent = getRecentMessages(count);
+  const transcript = recent
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join('\n');
+
+  try {
+    const res = await client.chat.completions.create({
+      model: config.model,
+      max_tokens: 512,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a concise summarizer. Summarize the following conversation in 3-5 bullet points, preserving key decisions, facts learned, and action items. Be terse.',
+        },
+        { role: 'user', content: transcript },
+      ],
+    });
+    const summary = res.choices[0]?.message?.content?.trim() ?? '';
+    if (summary) saveSessionSummary(sessionId, summary, count);
+  } catch {
+    // Non-critical — silently skip if summarization fails
+  }
+}
+
+/**
+ * Build the history message list, prepending any stored session summary
+ * as a system message so the model has context without the full transcript.
+ */
+function buildHistory(systemPrompt: string): OAIMessage[] {
+  const sessionId = getOrCreateSession();
+  const stored = getSessionSummary(sessionId);
+  const messages: OAIMessage[] = [{ role: 'system', content: systemPrompt }];
+
+  if (stored) {
+    messages.push({
+      role: 'system',
+      content: `## Earlier in this session (summary)\n${stored.summary}`,
+    });
+  }
+
+  const recent = getRecentMessages(20);
+  messages.push(...recent.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })));
+  return messages;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,16 +329,18 @@ function parseUserInput(raw: string): OpenAIContent {
 
 /**
  * Runs a prompt through an external CLI tool (e.g. "claude -p", "sgpt").
- * The prompt is appended as the last shell argument.
- * Streams stdout to the terminal and returns the full response text.
+ * The prompt is passed as the last argument to the command.
+ * Uses spawn with an argument array (no shell) to prevent command injection.
  */
 async function runSubprocess(cmd: string, prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Shell-escape the prompt and append as last argument
-    const escapedPrompt = prompt.replace(/'/g, `'\\''`);
-    const fullCmd = `${cmd} '${escapedPrompt}'`;
+    // Split cmd into executable + fixed args; append prompt as a separate argument.
+    // No shell=true — eliminates injection via subprocess_cmd config value.
+    const parts = cmd.trim().split(/\s+/);
+    const executable = parts[0];
+    const args = [...parts.slice(1), prompt];
 
-    const child = spawn('bash', ['-c', fullCmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let fullText = '';
 
@@ -512,16 +610,32 @@ async function runConversationLoop(
 
 export async function runAgent(
   userInput?: string,
-  opts: { model?: string; provider?: string } = {},
+  opts: { model?: string; provider?: string; daemon?: boolean } = {},
 ): Promise<void> {
   const config = loadConfig({
     model: opts.model,
     provider: opts.provider as JarvisConfig['provider'] | undefined,
   });
 
+  initToolConfig(config.allowed_paths);
+
+  // --daemon: run scheduled tasks only, no interactive session
+  if (opts.daemon) {
+    const count = startScheduler();
+    if (count === 0) {
+      process.stderr.write('[JARVIS daemon] No scheduled_tasks configured in jarvis.yaml — exiting.\n');
+      return;
+    }
+    process.stderr.write(`[JARVIS daemon] Running ${count} scheduled task(s). Press Ctrl+C to stop.\n`);
+    process.on('SIGINT', () => { stopScheduler(); closeDb(); process.exit(0); });
+    process.on('SIGTERM', () => { stopScheduler(); closeDb(); process.exit(0); });
+    // Keep process alive — cron manages its own event loop keepalive
+    return;
+  }
+
   const identity = loadIdentity();
   const ctx = buildProjectContext();
-  const systemPrompt = buildSystemPrompt(identity, ctx);
+  const systemPrompt = buildSystemPrompt(identity, ctx, config.personality);
 
   if (config.provider === 'subprocess') {
     if (userInput) {
@@ -547,11 +661,8 @@ async function processOneShot(
   userInput: string,
   config: JarvisConfig,
 ): Promise<void> {
-  const history = getRecentMessages(20);
-  const messages: OAIMessage[] = [
-    { role: 'system', content: systemPrompt },
-    ...history.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
-  ];
+  void maybeAutoSummarize(client, config);
+  const messages = buildHistory(systemPrompt);
 
   const parsed = parseUserInput(userInput);
   messages.push({ role: 'user', content: parsed });
@@ -576,11 +687,8 @@ async function runRepl(
   console.log(`Provider: ${config.provider} | Model: ${config.model}`);
   console.log('Commands: /memory  /history  /forget <key>  /clear  /exit\n');
 
-  const history = getRecentMessages(20);
-  const messages: OAIMessage[] = [
-    { role: 'system', content: systemPrompt },
-    ...history.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
-  ];
+  void maybeAutoSummarize(client, config);
+  const messages = buildHistory(systemPrompt);
 
   const doPrompt = (): void => {
     rl.question('> ', async (input) => {
